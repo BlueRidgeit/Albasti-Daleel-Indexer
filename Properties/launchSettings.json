@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "albasti_spo_indexer": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7033",
+      "launchBrowser": false
+    }
+  }
+}
