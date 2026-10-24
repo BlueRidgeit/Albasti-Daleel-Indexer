@@ -1,224 +1,177 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using Microsoft.Identity.Client;
+using Azure.Storage.Queues;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using UglyToad.PdfPig;
-using DocumentFormat.OpenXml.Packaging;
-using DocumentFormat.OpenXml.Wordprocessing;
-using System.Security.Cryptography;
 
+/// <summary>
+/// Manual re-index. Walks one or more SharePoint document libraries and enqueues every file onto
+/// the same ingestion queue the delta crawler uses, so the resilient SharePointWorker pipeline
+/// (throttle handling + retry queue) does the extraction/embedding/indexing.
+///
+/// On demand via HTTP:
+///   POST /api/reindex                      -> re-index all ENABLED libraries
+///   POST /api/reindex?driveId=...          -> re-index a single library (label resolved from LibraryStore)
+///   POST /api/reindex?driveId=...&library= -> re-index a single library with an explicit label
+/// </summary>
 public class SharePointIngestor
 {
     private readonly ILogger<SharePointIngestor> _logger;
     private readonly HttpClient _http = new();
+    private readonly QueueClient _queue;
 
     public SharePointIngestor(ILogger<SharePointIngestor> logger)
     {
         _logger = logger;
+        _queue = new QueueClient(Env("AzureWebJobsStorage"), "spo-ingestion-queue");
+        _queue.CreateIfNotExists();
     }
 
-    [Function(nameof(SharePointIngestor))]
-    public async Task Run([TimerTrigger("0 0 * * * *")] TimerInfo timer)
+    [Function("FullReindex")]
+    public async Task<IResult> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "reindex")] HttpRequest req)
     {
-        _logger.LogInformation($"SharePoint ingestion started @ {DateTime.UtcNow}");
+        // Un-index path: remove a library from the crawl list and delete its indexed chunks.
+        // No Graph access needed, so handle it before acquiring a token.
+        if (string.Equals(req.Query["action"], "remove", StringComparison.OrdinalIgnoreCase))
+        {
+            string? removeDriveId = req.Query["driveId"];
+            if (string.IsNullOrWhiteSpace(removeDriveId))
+            {
+                return Results.BadRequest(new { error = "driveId is required for remove." });
+            }
+
+            string? requestedLabel = req.Query["library"];
+            var existing = await LibraryStore.GetAsync(removeDriveId);
+            var label = !string.IsNullOrWhiteSpace(requestedLabel) ? requestedLabel : existing?.Label;
+
+            await LibraryStore.DeleteAsync(removeDriveId);
+            int deleted = !string.IsNullOrWhiteSpace(label)
+                ? await DeleteLibraryChunks(label!)
+                : 0;
+
+            _logger.LogInformation($"Un-indexed '{label}' ({removeDriveId}): removed from crawl list, deleted {deleted} chunks.");
+            return Results.Ok(new { removed = label, deletedChunks = deleted });
+        }
+
+        _logger.LogInformation($"Manual re-index started @ {DateTime.UtcNow}");
 
         string token = await GetGraphToken();
         _http.DefaultRequestHeaders.Authorization =
             new AuthenticationHeaderValue("Bearer", token);
 
-        var root = await GraphGet(
-            $"https://graph.microsoft.com/v1.0/drives/{Env("DRIVE_ID")}/root/children");
-
-        var items = root.GetProperty("value").EnumerateArray().ToList();
-        _logger.LogInformation($"Discovered {items.Count} items at root level.");
-
-        foreach (var item in items)
+        // Resolve which libraries to re-index.
+        List<LibraryEntry> targets;
+        string? driveId = req.Query["driveId"];
+        if (!string.IsNullOrWhiteSpace(driveId))
         {
-            string name = item.GetProperty("name").GetString();
-
-            if (item.TryGetProperty("folder", out _))
-            {
-                _logger.LogInformation($"Entering folder: {name}");
-                await ProcessFolder(item.GetProperty("id").GetString());
-            }
-            else
-            {
-                await ProcessFile(item);
-            }
+            string? label = req.Query["library"];
+            var entry = await LibraryStore.GetAsync(driveId)
+                        ?? new LibraryEntry(driveId!, string.IsNullOrWhiteSpace(label) ? driveId! : label!, true);
+            // Register/enable this library so the scheduled crawler keeps it in sync going forward.
+            await LibraryStore.UpsertAsync(entry.DriveId, entry.Label, true);
+            targets = new List<LibraryEntry> { entry };
         }
+        else
+        {
+            targets = await LibraryStore.GetEnabledAsync();
+        }
+
+        // Optional extension filter, e.g. ?ext=pdf re-enqueues only PDF files (used to re-OCR
+        // PDFs with Document Intelligence without re-processing every Word document).
+        string? extFilter = req.Query["ext"];
+
+        int enqueued = 0;
+        foreach (var library in targets)
+        {
+            enqueued += await EnqueueChildren(library, null, extFilter);
+        }
+
+        _logger.LogInformation(
+            $"Re-index enqueued {enqueued} {(string.IsNullOrWhiteSpace(extFilter) ? "" : extFilter + " ")}files across {targets.Count} libraries.");
+
+        return Results.Ok(new
+        {
+            libraries = targets.Select(t => t.Label),
+            ext = string.IsNullOrWhiteSpace(extFilter) ? null : extFilter,
+            enqueued
+        });
     }
 
-
-    private async Task ProcessFolder(string folderId)
+    // folderId == null => library root. extFilter (e.g. "pdf") limits which files are enqueued.
+    private async Task<int> EnqueueChildren(LibraryEntry library, string? folderId, string? extFilter = null)
     {
-        var children = await GraphGet(
-            $"https://graph.microsoft.com/v1.0/drives/{Env("DRIVE_ID")}/items/{folderId}/children");
+        string? url = folderId is null
+            ? $"https://graph.microsoft.com/v1.0/drives/{library.DriveId}/root/children"
+            : $"https://graph.microsoft.com/v1.0/drives/{library.DriveId}/items/{folderId}/children";
 
-        foreach (var item in children.GetProperty("value").EnumerateArray())
+        int count = 0;
+
+        while (!string.IsNullOrEmpty(url))
         {
-            // Folder
-            if (item.TryGetProperty("folder", out _))
+            var page = await GraphGet(url);
+
+            foreach (var item in page.GetProperty("value").EnumerateArray())
             {
-                if (item.TryGetProperty("id", out var folderIdProp))
+                if (item.TryGetProperty("folder", out _))
                 {
-                    await ProcessFolder(folderIdProp.GetString());
+                    if (item.TryGetProperty("id", out var idProp))
+                    {
+                        count += await EnqueueChildren(library, idProp.GetString(), extFilter);
+                    }
+                }
+                else if (item.TryGetProperty("file", out _))
+                {
+                    var fileName = item.TryGetProperty("name", out var n) ? n.GetString() : null;
+                    if (extFilter is null
+                        || (fileName?.EndsWith("." + extFilter, StringComparison.OrdinalIgnoreCase) ?? false))
+                    {
+                        await EnqueueFile(item, library);
+                        count++;
+                    }
                 }
             }
-            // File
-            else if (item.TryGetProperty("file", out _))
-            {
-                await ProcessFile(item);
-            }
-            // Everything else (shortcuts, unknown types)
-            else
-            {
-                _logger.LogInformation("Skipping non-file, non-folder item.");
-            }
+
+            url = page.TryGetProperty("@odata.nextLink", out var next)
+                ? next.GetString()
+                : null;
         }
+
+        return count;
     }
 
-
-    private async Task ProcessFile(JsonElement file)
+    private async Task EnqueueFile(JsonElement item, LibraryEntry library)
     {
-        string itemId = file.GetProperty("id").GetString()!;
-        string name = file.GetProperty("name").GetString();
-        string downloadUrl = file.GetProperty("@microsoft.graph.downloadUrl").GetString();
-        string? webUrl = GetOptionalString(file, "webUrl");
-        DateTimeOffset? lastModified = GetOptionalDateTimeOffset(file, "lastModifiedDateTime");
-
-        _logger.LogInformation($"Processing file: {name}");
-
-        byte[] bytes = await _http.GetByteArrayAsync(downloadUrl);
-        string text = ExtractText(name, bytes);
-
-        if (string.IsNullOrWhiteSpace(text))
+        var message = new
         {
-            _logger.LogInformation($"No extractable text in: {name}");
-            return;
-        }
-
-        var chunks = Chunk(text, 2000);
-        _logger.LogInformation($"File {name} split into {chunks.Count} chunks.");
-
-        foreach (var chunk in chunks)
-        {
-            float[] embedding = await CreateEmbedding(chunk);
-            await PushToSearch(
-                id: $"{itemId}-{HashChunk(chunk)}",
-                title: name,
-                url: webUrl,
-                lastModified: lastModified,
-                content: chunk,
-                embedding: embedding);
-        }
-    }
-
-    private string ExtractText(string fileName, byte[] bytes)
-    {
-        if (fileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
-        {
-            return Encoding.UTF8.GetString(bytes);
-        }
-
-        if (fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-        {
-            var sb = new StringBuilder();
-            using var pdf = PdfDocument.Open(bytes);
-
-            foreach (var page in pdf.GetPages())
-            {
-                sb.AppendLine(page.Text);
-            }
-
-            return sb.ToString();
-        }
-
-        if (fileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
-        {
-            using var ms = new MemoryStream(bytes);
-            using var doc = WordprocessingDocument.Open(ms, false);
-
-            return string.Join(
-                "\n",
-                doc.MainDocumentPart!
-                    .Document!
-                    .Body!
-                    .Descendants<Text>()
-                    .Select(t => t.Text)
-            );
-        }
-
-        return string.Empty;
-    }
-
-    private List<string> Chunk(string text, int size)
-    {
-        var list = new List<string>();
-        for (int i = 0; i < text.Length; i += size)
-        {
-            list.Add(text.Substring(i, Math.Min(size, text.Length - i)));
-        }
-        return list;
-    }
-
-    private async Task<float[]> CreateEmbedding(string input)
-    {
-        _http.DefaultRequestHeaders.Clear();
-        _http.DefaultRequestHeaders.Add("api-key", Env("EMBEDDING_KEY"));
-
-        var body = new { input };
-
-        var response = await _http.PostAsync(
-            $"{Env("EMBEDDING_ENDPOINT")}/openai/deployments/{Env("EMBEDDING_MODEL")}/embeddings?api-version=2024-02-15-preview",
-            new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
-
-        var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-
-        return doc.RootElement
-            .GetProperty("data")[0]
-            .GetProperty("embedding")
-            .EnumerateArray()
-            .Select(v => v.GetSingle())
-            .ToArray();
-    }
-
-    private async Task PushToSearch(
-        string id,
-        string title,
-        string? url,
-        DateTimeOffset? lastModified,
-        string content,
-        float[] embedding)
-    {
-        var body = new
-        {
-            value = new[]
-            {
-                new
-                {
-                    id,
-                    title,
-                    url,
-                    lastModified,
-                    content,
-                    embedding
-                }
-            }
+            driveId = library.DriveId,
+            library = library.Label,
+            itemId = item.GetProperty("id").GetString(),
+            fileName = item.GetProperty("name").GetString(),
+            webUrl = item.TryGetProperty("webUrl", out var w) ? w.GetString() : null,
+            lastModified = item.TryGetProperty("lastModifiedDateTime", out var lm) ? lm.GetString() : null
         };
 
-        _http.DefaultRequestHeaders.Clear();
-        _http.DefaultRequestHeaders.Add("api-key", Env("SEARCH_KEY"));
+        var payload = Convert.ToBase64String(
+            Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message)));
 
-        await _http.PostAsync(
-            $"{Env("SEARCH_SERVICE")}/indexes/{Env("SEARCH_INDEX")}/docs/index?api-version=2025-11-01-preview",
-            new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+        await _queue.SendMessageAsync(payload);
     }
 
     private async Task<JsonElement> GraphGet(string url)
     {
         var resp = await _http.GetAsync(url);
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            var error = await resp.Content.ReadAsStringAsync();
+            _logger.LogError("Graph call failed {StatusCode} for {Url}: {Error}", resp.StatusCode, url, error);
+            throw new InvalidOperationException($"Graph call failed: {resp.StatusCode}");
+        }
+
         return JsonDocument.Parse(await resp.Content.ReadAsStringAsync()).RootElement;
     }
 
@@ -237,38 +190,55 @@ public class SharePointIngestor
         return result.AccessToken;
     }
 
+    // Delete every indexed chunk tagged with this library label (uses the Search ADMIN key).
+    private async Task<int> DeleteLibraryChunks(string label)
+    {
+        var search = Env("SEARCH_SERVICE").TrimEnd('/');
+        var index = Env("SEARCH_INDEX");
+        var key = Env("SEARCH_KEY");
+        var filter = "library eq '" + label.Replace("'", "''") + "'";
+        int total = 0;
+
+        for (int guard = 0; guard < 1000; guard++)
+        {
+            var queryBody = JsonSerializer.Serialize(new { search = "*", filter, select = "id", top = 1000 });
+            using var queryReq = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"{search}/indexes/{index}/docs/search?api-version=2024-07-01");
+            queryReq.Headers.Add("api-key", key);
+            queryReq.Content = new StringContent(queryBody, Encoding.UTF8, "application/json");
+            using var queryResp = await _http.SendAsync(queryReq);
+            if (!queryResp.IsSuccessStatusCode) break;
+
+            var doc = JsonDocument.Parse(await queryResp.Content.ReadAsStringAsync()).RootElement;
+            var ids = doc.GetProperty("value").EnumerateArray()
+                .Select(e => e.GetProperty("id").GetString())
+                .Where(id => !string.IsNullOrEmpty(id))
+                .ToList();
+            if (ids.Count == 0) break;
+
+            var actions = ids.Select(id => new Dictionary<string, object>
+            {
+                ["@search.action"] = "delete",
+                ["id"] = id!
+            });
+            var deleteBody = JsonSerializer.Serialize(new { value = actions });
+            using var deleteReq = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"{search}/indexes/{index}/docs/index?api-version=2024-07-01");
+            deleteReq.Headers.Add("api-key", key);
+            deleteReq.Content = new StringContent(deleteBody, Encoding.UTF8, "application/json");
+            using var deleteResp = await _http.SendAsync(deleteReq);
+            if (!deleteResp.IsSuccessStatusCode) break;
+
+            total += ids.Count;
+            await Task.Delay(800); // let the index settle before the next page
+        }
+
+        return total;
+    }
+
     private static string Env(string key) =>
         Environment.GetEnvironmentVariable(key)
         ?? throw new InvalidOperationException($"Missing setting: {key}");
-
-    private static string? GetOptionalString(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property) ||
-            property.ValueKind == JsonValueKind.Null)
-        {
-            return null;
-        }
-
-        return property.GetString();
-    }
-
-    private static DateTimeOffset? GetOptionalDateTimeOffset(JsonElement element, string propertyName)
-    {
-        var raw = GetOptionalString(element, propertyName);
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return null;
-        }
-
-        return DateTimeOffset.TryParse(raw, out var parsed) ? parsed : null;
-    }
-
-    private static string HashChunk(string text)
-    {
-        using var sha = SHA256.Create();
-        var bytes = Encoding.UTF8.GetBytes(text);
-        var hash = sha.ComputeHash(bytes);
-
-        return Convert.ToHexString(hash);
-    }
 }

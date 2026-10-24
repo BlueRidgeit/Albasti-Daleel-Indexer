@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -21,7 +21,33 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Storage.Queues" Version="5.3.0" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Timer" Version="4.3.1" />
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.7" />
-    <PackageReference Include="UglyToad.PdfPig" Version="1.7.0-custom-5" />
+  </ItemGroup>
+
+  <!--
+    UglyToad.PdfPig 1.7.0-custom-5 is a private/custom build with no public NuGet feed.
+    It is referenced directly from the committed DLLs in libs/ instead of via PackageReference.
+  -->
+  <ItemGroup>
+    <Reference Include="UglyToad.PdfPig">
+      <HintPath>libs\UglyToad.PdfPig.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UglyToad.PdfPig.Core">
+      <HintPath>libs\UglyToad.PdfPig.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UglyToad.PdfPig.Fonts">
+      <HintPath>libs\UglyToad.PdfPig.Fonts.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UglyToad.PdfPig.Tokenization">
+      <HintPath>libs\UglyToad.PdfPig.Tokenization.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UglyToad.PdfPig.Tokens">
+      <HintPath>libs\UglyToad.PdfPig.Tokens.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

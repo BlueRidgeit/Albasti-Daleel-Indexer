@@ -33,13 +33,34 @@ public class SharePointCrawler
         _http.DefaultRequestHeaders.Authorization =
             new AuthenticationHeaderValue("Bearer", token);
 
-        string driveId = Env("DRIVE_ID");
+        var libraries = await LibraryStore.GetEnabledAsync();
+        _logger.LogInformation(
+            $"Crawling {libraries.Count} enabled libraries: {string.Join(", ", libraries.Select(l => l.Label))}");
 
-        // ✅ Load last delta (if any)
-        string? deltaLink = await GetDeltaLinkAsync(driveId);
+        foreach (var library in libraries)
+        {
+            try
+            {
+                await CrawlLibrary(library);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Crawl failed for library {library.Label}");
+            }
+        }
 
-        string url = string.IsNullOrEmpty(deltaLink)
-            ? $"https://graph.microsoft.com/v1.0/drives/{driveId}/root/delta"
+        _logger.LogInformation("Crawler finished");
+    }
+
+    private async Task CrawlLibrary(LibraryEntry library)
+    {
+        _logger.LogInformation($"Crawling library '{library.Label}' ({library.DriveId})");
+
+        // DeltaState is keyed per drive, so each library tracks its own incremental delta.
+        string? deltaLink = await GetDeltaLinkAsync(library.DriveId);
+
+        string? url = string.IsNullOrEmpty(deltaLink)
+            ? $"https://graph.microsoft.com/v1.0/drives/{library.DriveId}/root/delta"
             : deltaLink;
 
         while (!string.IsNullOrEmpty(url))
@@ -50,56 +71,113 @@ public class SharePointCrawler
             {
                 foreach (var item in items.EnumerateArray())
                 {
-                    // ✅ Skip non-files
+                    // Deletions first — a removed item may no longer carry a "file" facet.
+                    if (item.TryGetProperty("@removed", out _))
+                    {
+                        var removedId = item.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                        if (!string.IsNullOrEmpty(removedId))
+                            await DeleteFromIndex(removedId!);
+                        continue;
+                    }
+
+                    // Skip folders / non-file items.
                     if (!item.TryGetProperty("file", out _))
                         continue;
 
-                    // ✅ Skip deletions (handled later in Phase 3.4)
-                    if (item.TryGetProperty("@removed", out _))
-                        continue;
-
-                    await EnqueueFile(item);
+                    await EnqueueFile(item, library);
                 }
             }
 
             if (page.TryGetProperty("@odata.nextLink", out var next))
             {
                 url = next.GetString();
+
+                // Persist the in-progress cursor after every page so a throttled or interrupted
+                // crawl RESUMES from here on the next tick instead of restarting the whole
+                // library from scratch (the bug that re-enqueued the corpus every 10 minutes).
+                if (!string.IsNullOrEmpty(url))
+                    await SaveDeltaLinkAsync(library.DriveId, url!);
             }
-            
             else if (page.TryGetProperty("@odata.deltaLink", out var delta))
             {
                 var dl = delta.GetString();
                 if (!string.IsNullOrEmpty(dl))
-                    await SaveDeltaLinkAsync(driveId, dl);
+                    await SaveDeltaLinkAsync(library.DriveId, dl);
 
                 break;
             }
-
             else
             {
                 break;
             }
         }
-
-        _logger.LogInformation("Crawler finished");
     }
 
-    private async Task EnqueueFile(JsonElement item)
+    private async Task EnqueueFile(JsonElement item, LibraryEntry library)
     {
+        // Use TryGetProperty everywhere: some Graph delta items legitimately lack webUrl or
+        // lastModifiedDateTime, and a single missing key must NOT throw and abort the whole
+        // library crawl (which leaves the delta cursor stuck and stops all indexing).
+        var itemId = item.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+        var fileName = item.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
+        if (string.IsNullOrEmpty(itemId) || string.IsNullOrEmpty(fileName))
+            return;
+
         var message = new
         {
-            driveId = Env("DRIVE_ID"),
-            itemId = item.GetProperty("id").GetString(),
-            fileName = item.GetProperty("name").GetString(),
-            webUrl = item.GetProperty("webUrl").GetString(),
-            lastModified = item.GetProperty("lastModifiedDateTime").GetString()
+            driveId = library.DriveId,
+            library = library.Label,
+            itemId,
+            fileName,
+            webUrl = item.TryGetProperty("webUrl", out var w) ? w.GetString() : null,
+            lastModified = item.TryGetProperty("lastModifiedDateTime", out var lm) ? lm.GetString() : null
         };
 
         var payload = Convert.ToBase64String(
             Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message)));
 
         await _queue.SendMessageAsync(payload);
+    }
+
+    // Remove every indexed chunk that belonged to a file deleted in SharePoint.
+    // Chunk ids are tracked in the IndexRegistry table, so no index-side filtering is required.
+    private async Task DeleteFromIndex(string itemId)
+    {
+        var searchIds = await IndexRegistry.GetSearchIdsAsync(itemId);
+        if (searchIds.Count == 0)
+        {
+            _logger.LogInformation($"No tracked chunks for removed item {itemId}; nothing to delete.");
+            return;
+        }
+
+        var body = new
+        {
+            value = searchIds.Select(id => new Dictionary<string, object>
+            {
+                ["@search.action"] = "delete",
+                ["id"] = id
+            }).ToArray()
+        };
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"{Env("SEARCH_SERVICE")}/indexes/{Env("SEARCH_INDEX")}/docs/index?api-version=2024-07-01");
+        request.Headers.Add("api-key", Env("SEARCH_KEY"));
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+        using var response = await _http.SendAsync(request);
+
+        if (response.IsSuccessStatusCode)
+        {
+            await IndexRegistry.RemoveAsync(itemId);
+            _logger.LogInformation($"Deleted {searchIds.Count} indexed chunks for removed item {itemId}.");
+        }
+        else
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            _logger.LogError($"Failed to delete chunks for {itemId}: {response.StatusCode} {error}");
+        }
     }
 
     private async Task<JsonElement> GraphGet(string url)
@@ -137,28 +215,24 @@ public class SharePointCrawler
         return result.AccessToken;
     }
 
-    private TableClient GetDeltaTable()
-{
-    return new TableClient(
-        Env("AzureWebJobsStorage"),
-        "DeltaState");
-}
+    private TableClient GetDeltaTable() =>
+        new TableClient(Env("AzureWebJobsStorage"), "DeltaState");
 
-private async Task<string?> GetDeltaLinkAsync(string driveId)
-{
-    var table = GetDeltaTable();
-    await table.CreateIfNotExistsAsync();
+    private async Task<string?> GetDeltaLinkAsync(string driveId)
+    {
+        var table = GetDeltaTable();
+        await table.CreateIfNotExistsAsync();
 
-    try
-    {
-        var entity = await table.GetEntityAsync<TableEntity>("Drive", driveId);
-        return entity.Value.GetString("DeltaLink");
+        try
+        {
+            var entity = await table.GetEntityAsync<TableEntity>("Drive", driveId);
+            return entity.Value.GetString("DeltaLink");
+        }
+        catch
+        {
+            return null;
+        }
     }
-    catch
-    {
-        return null;
-    }
-}
 
     private async Task SaveDeltaLinkAsync(string driveId, string deltaLink)
     {

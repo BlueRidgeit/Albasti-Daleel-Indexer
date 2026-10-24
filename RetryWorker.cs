@@ -28,42 +28,55 @@ public class RetryWorker
     }
 
     [Function(nameof(RetryWorker))]
-    public async Task Run([TimerTrigger("0 */10 * * * *")] TimerInfo timer)
+    public async Task Run([TimerTrigger("0 */5 * * * *")] TimerInfo timer)
     {
         _logger.LogInformation("Retry worker tick");
 
-        QueueMessage[] messages = await _retryQueue.ReceiveMessagesAsync(16);
+        int processed = 0;
 
-        foreach (var msg in messages)
+        // Drain in batches (32 = max per receive) so the retry queue can actually keep up,
+        // instead of the old 16-messages-per-10-minutes trickle that let retries pile into millions.
+        for (int batch = 0; batch < 32; batch++)
         {
-            var decoded =
-                Encoding.UTF8.GetString(Convert.FromBase64String(msg.MessageText));
+            QueueMessage[] messages = await _retryQueue.ReceiveMessagesAsync(32);
+            if (messages.Length == 0)
+                break;
 
-            var retry = JsonSerializer.Deserialize<RetryChunkMessage>(decoded);
-            if (retry == null)
+            foreach (var msg in messages)
             {
-                await _retryQueue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt);
-                continue;
-            }
+                var decoded =
+                    Encoding.UTF8.GetString(Convert.FromBase64String(msg.MessageText));
 
-            if (retry.RetryAfterUtc > DateTime.UtcNow)
-                continue;
-
-            
-            string retryPayloadB64 = Convert.ToBase64String(
-                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+                var retry = JsonSerializer.Deserialize<RetryChunkMessage>(decoded);
+                if (retry == null)
                 {
-                    itemId = retry.ItemId,
-                    fileName = retry.FileName,
-                    webUrl = retry.WebUrl,
-                    lastModified = retry.LastModified,
-                    chunk = retry.Chunk,
-                    isRetry = true
-                }))
-            );
+                    await _retryQueue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt);
+                    continue;
+                }
 
-            await _mainQueue.SendMessageAsync(retryPayloadB64);
-            await _retryQueue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt);
+                if (retry.RetryAfterUtc > DateTime.UtcNow)
+                    continue;
+
+                string retryPayloadB64 = Convert.ToBase64String(
+                    Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+                    {
+                        itemId = retry.ItemId,
+                        driveId = retry.DriveId,
+                        library = retry.Library,
+                        fileName = retry.FileName,
+                        webUrl = retry.WebUrl,
+                        lastModified = retry.LastModified,
+                        chunk = retry.Chunk,
+                        isRetry = true
+                    }))
+                );
+
+                await _mainQueue.SendMessageAsync(retryPayloadB64);
+                await _retryQueue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt);
+                processed++;
+            }
         }
+
+        _logger.LogInformation($"Retry worker processed {processed} messages");
     }
 }
